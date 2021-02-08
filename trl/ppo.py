@@ -58,7 +58,7 @@ class PPOTrainer:
 
     default_params = {
         "lr": 1.41e-5,
-        "adap_kl_ctrl": True,
+        "adap_kl_ctrl": False,
         "init_kl_coef":0.2,
         "target": 6,
         "horizon":10000,
@@ -101,13 +101,13 @@ class PPOTrainer:
         self.ref_model = ref_model
         self.model = model
         self.optimizer = Adam(model.parameters(), lr=self.ppo_params['lr'])
-
-        self.kl_ctl = AdaptiveKLController(self.ppo_params['init_kl_coef'],
+        if self.ppo_params['adap_kl_ctrl']:
+            self.kl_ctl = AdaptiveKLController(self.ppo_params['init_kl_coef'],
                                            self.ppo_params['target'],
                                            self.ppo_params['horizon'])
-
-
-    def step(self, query, response, scores):
+        else:
+            self.kl_ctl=FixedKLController(self.ppo_params['init_kl_coef'])
+    def step(self, query, response, scores,nolegal_index):
         """
         Run a PPO optimisation step.
 
@@ -120,7 +120,8 @@ class PPOTrainer:
             train_stats (dict): a summary of the training statistics
         """
 
-        bs = self.ppo_params['batch_size']
+#         bs = self.ppo_params['batch_size']
+        bs=len(query) # hdj
         timing = dict()
         t0 = time.time()
 
@@ -128,7 +129,7 @@ class PPOTrainer:
         model_input = torch.cat((query, response), axis=1)
 
         t = time.time()
-        logprobs, ref_logprobs, values = self.batched_forward_pass(model_input, gen_len)
+        logprobs, ref_logprobs, values = self.batched_forward_pass(model_input, gen_len,nolegal_index)
         timing['time/ppo/forward_pass'] = time.time()-t
 
         t = time.time()
@@ -137,6 +138,7 @@ class PPOTrainer:
 
         t = time.time()
         all_stats = []
+        
         idxs = list(range(bs))
         for _ in range(self.ppo_params['ppo_epochs']):
             random.shuffle(idxs)
@@ -167,22 +169,50 @@ class PPOTrainer:
         stats.update(timing)
         return stats
 
-    def batched_forward_pass(self, model_input, gen_len):
+    def batched_forward_pass(self, model_input, gen_len,nolegal_index):
         """Calculate model outputs in multiple batches."""
-        bs = self.ppo_params['batch_size']
-        fbs = self.ppo_params['forward_batch_size']
+        bs = self.ppo_params['batch_size']#128
+        fbs = self.ppo_params['forward_batch_size']#16
         logprobs = []
         ref_logprobs = []
         values = []
 
         for i in range(int(self.ppo_params['batch_size']/fbs)):
+            # hdj
+            if i*fbs>=len(model_input):
+                break
+            # hdj
             m_input = model_input[i*fbs:(i+1)*fbs]
             logits, _, v = self.model(m_input)
+            
+            logits[:,:,nolegal_index]=np.NINF# hdj
+            
             ref_logits, _, _ = self.ref_model(m_input)
-
-            values.append(v[:, -gen_len-1:-1].detach())
+            
+            ref_logits[:,:,nolegal_index]=np.NINF # hdj
+#             print('ref_logits shape :',ref_logits.shape)
+#             logits, v = self.model(m_input)
+#             ref_logits, _ = self.ref_model(m_input)
+#             print('gen_len',gen_len)#20
+#             print('ref_logits.shape ',ref_logits.shape)#([16, 28, 50257])
+#             print('v.shape',v.shape)#([16, 28])
+            
+            values.append(v[:, -gen_len:].detach())#
+#             print('values.shape',v[:, -gen_len:].shape)#([16, 20])
+#             values.append(v[:, -gen_len-1:-1].detach())
+#             print('m_input.shape ',m_input.shape)#([16, 28])
+#             print('logits.shape ',logits.shape)#([16, 28, 50257])
+#             print('logprobs.shape',logprobs_from_logits(logits[:,:-1,:], m_input[:,1:])[:, -gen_len:].shape)#([16, 20])
+            
+#             print('logits.shape ',logprobs_from_logits(logits[:,:-1,:], m_input[:,1:]).shape)
+            
             logprobs.append(logprobs_from_logits(logits[:,:-1,:], m_input[:,1:])[:, -gen_len:].detach())
+            
+            
+            
             ref_logprobs.append(logprobs_from_logits(ref_logits[:,:-1,:], m_input[:,1:])[:, -gen_len:].detach())
+#             print('ref_logprobs.shape',logprobs_from_logits(ref_logits[:,:-1,:], m_input[:,1:])[:, -gen_len:].shape)#([16, 20])
+#             print('ref_logits.shape ',logprobs_from_logits(ref_logits[:,:-1,:], m_input[:,1:]).shape)
 
         return torch.cat(logprobs), torch.cat(ref_logprobs), torch.cat(values)
 
@@ -200,22 +230,33 @@ class PPOTrainer:
         kl = logprobs - ref_logprobs
         non_score_reward = -self.kl_ctl.value * kl
         rewards = non_score_reward.clone().detach()
-        rewards[:, -1] += scores
-        return rewards, non_score_reward, self.kl_ctl.value
+        #TODO 这里也抛弃了最后的一个值
+        rewards[:, -1] += scores ##TODO important论文公式地方  这里是R(x,y)=r(x,y)- 
+        return rewards, non_score_reward, self.kl_ctl.value 
 
     def loss(self, old_logprobs, values, rewards, query, response, model_input):
         """Calculate policy and value losses."""
+#         print('old_logprobs  shape:',old_logprobs.shape)
+#         print(' values shape:',rewards.shape)
+#         print(' rewards shape:',rewards.shape)
+#         print(' query shape:',query.shape)
+#         print(' response shape:',response.shape)
+#         print(' model_input shape:',model_input.shape)
         lastgaelam = 0
         advantages_reversed = []
         gen_len = response.shape[1]
 
+        #这里倒序计算GAE
         for t in reversed(range(gen_len)):
+            
+#             print('values.shape ',values.shape)
             nextvalues = values[:, t + 1] if t < gen_len - 1 else 0.0
+#             print('t 的值',t,'gen_len :',gen_len,'nextvalues :',nextvalues)
             delta = rewards[:, t] + self.ppo_params['gamma'] * nextvalues - values[:, t]
             lastgaelam = delta + self.ppo_params['gamma'] * self.ppo_params['lam'] * lastgaelam
             advantages_reversed.append(lastgaelam)
         advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
-
+#         print('advantages shape',advantages.shape)
         returns = advantages + values
         advantages = whiten(advantages)
         advantages = advantages.detach()
@@ -232,20 +273,18 @@ class PPOTrainer:
 
         vf_losses1 = (vpred - returns)**2
         vf_losses2 = (vpredclipped - returns)**2
-        vf_loss = .5 * torch.mean(torch.max(vf_losses1, vf_losses2))
+        vf_loss = .5 * torch.mean(torch.max(vf_losses1, vf_losses2))# critic_loss
         vf_clipfrac =  torch.mean(torch.gt(vf_losses2, vf_losses1).double())
 
-        ratio = torch.exp(logprob - old_logprobs)
+        ratio = torch.exp(logprob - old_logprobs)#ratio 对应论文Log(π(y|x) / p(y|x))
 
-        pg_losses = -advantages * ratio
-        pg_losses2 = -advantages * torch.clamp(ratio,
-                                               1.0 - self.ppo_params['cliprange'],
-                                               1.0 + self.ppo_params['cliprange'])
+        pg_losses = -advantages * ratio #p1
+        pg_losses2 = -advantages * torch.clamp(ratio,1.0 - self.ppo_params['cliprange'],1.0 + self.ppo_params['cliprange'])#p2
 
-        pg_loss = torch.mean(torch.max(pg_losses, pg_losses2))
+        pg_loss = torch.mean(torch.max(pg_losses, pg_losses2))#actor_loss
         pg_clipfrac = torch.mean(torch.gt(pg_losses2, pg_losses).double())
 
-        loss = pg_loss + self.ppo_params['vf_coef'] * vf_loss
+        loss = pg_loss + self.ppo_params['vf_coef'] * vf_loss # total_loss
 
         entropy = torch.mean(entropy_from_logits(logits))
         approxkl = .5 * torch.mean((logprob - old_logprobs)**2)

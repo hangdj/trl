@@ -10,7 +10,7 @@ from torch import nn
 from torch.nn import Identity
 import torch.nn.functional as F
 import torch
-
+import numpy as np
 # Cell
 
 class ValueHead(nn.Module):
@@ -26,20 +26,25 @@ class ValueHead(nn.Module):
         if hasattr(config, "summary_use_proj") and config.summary_use_proj:
             if hasattr(config, "summary_proj_to_labels") and config.summary_proj_to_labels and config.num_labels > 0:
                 num_classes = config.num_labels
+#                 print('summary_proj_to_labels')
             else:
                 num_classes = config.hidden_size
+#                 print('not summary_proj_to_labels')
             self.summary = nn.Linear(config.hidden_size, num_classes)
 
         self.activation = Identity()
         if hasattr(config, "summary_activation") and config.summary_activation == "tanh":
+#             print('summary_activation')
             self.activation = nn.Tanh()
 
         self.first_dropout = Identity()
         if hasattr(config, "summary_first_dropout") and config.summary_first_dropout > 0:
+#             print('summary_first_dropout')
             self.first_dropout = nn.Dropout(config.summary_first_dropout)
 
         self.last_dropout = Identity()
         if hasattr(config, "summary_last_dropout") and config.summary_last_dropout > 0:
+#             print('summary_last_dropout')
             self.last_dropout = nn.Dropout(config.summary_last_dropout)
 
         self.flatten = nn.Flatten()
@@ -62,6 +67,8 @@ class GPT2HeadWithValueModel(GPT2PreTrainedModel):
     """The GPT2HeadWithValueModel class implements a GPT2 language model with a secondary, scalar head."""
     def __init__(self, config):
         super().__init__(config)
+#         print(config)
+        print('vocab_size shape :',config.vocab_size)
         config.num_labels = 1
         self.transformer = GPT2Model(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -100,26 +107,49 @@ class GPT2HeadWithValueModel(GPT2PreTrainedModel):
         )
 
         hidden_states = transformer_outputs[0]
-
-        lm_logits = self.lm_head(hidden_states)
+#         print('hidden_states.shape*** ',hidden_states.shape)
+        lm_logits = self.lm_head(hidden_states)#输出的是词表大小 （batch,vocab_size）
         value = self.v_head(hidden_states).squeeze(-1)
-
+#         print('value.shape:  ****',value.shape)#输出的是类别大小 (bacth,class)
         outputs = (lm_logits,) + transformer_outputs[1:] + (value,)
 
         return outputs
 
 # Cell
 
-def respond_to_batch(model, queries, txt_len=20, top_k=0, top_p=1.0):
+def respond_to_batch(model, queries,nolegal_index, txt_len=20, top_k=0, top_p=1.0):# hdj
     """Sample text from language model."""
     input_ids = queries
+#     fbs=128
     for i in range(txt_len):
         # Get Logits
         outputs = model(input_ids)
+#           print('outputs shape :',outputs[0].shape) outputs shape : torch.Size([16, 55, 50257])
         next_token_logits = outputs[0][:, -1, :]
+        next_token_logits[:,nolegal_index]=np.NINF # hdj
+#           print('before next_token_logits shape :',next_token_logits.shape) before next_token_logits shape : torch.Size([16, 50257])
         next_token_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
+#           print('after next_token_logits shape :',next_token_logits.shape) after next_token_logits shape : torch.Size([16, 50257])
         # Sample
         probs = F.softmax(next_token_logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
         input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=-1)
     return input_ids[:, -txt_len:]
+#     input_idsAll=[]
+#     for j in range(int(256/fbs)):
+#         for i in range(txt_len):
+#             # Get Logits
+#             outputs = model(input_ids[j*fbs:(j+1)*fbs])
+#     #         print('outputs shape :',outputs[0].shape) outputs shape : torch.Size([16, 55, 50257])
+#             next_token_logits = outputs[0][:, -1, :]
+#     #         next_token_logits[:,nolegal_index]=np.NINF
+#     #         print('before next_token_logits shape :',next_token_logits.shape) before next_token_logits shape : torch.Size([16, 50257])
+#             next_token_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
+#     #         print('after next_token_logits shape :',next_token_logits.shape) after next_token_logits shape : torch.Size([16, 50257])
+#             # Sample
+#             probs = F.softmax(next_token_logits, dim=-1)
+#             next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+#             input_ids_raw = torch.cat([input_ids[j*fbs:(j+1)*fbs], next_token.unsqueeze(-1)], dim=-1)
+#         input_idsAll.append(input_ids_raw)
+#     print('input_idsAll shape :',torch.cat(input_idsAll).shape)       
+#     return torch.cat(input_idsAll)[:, -txt_len:]
